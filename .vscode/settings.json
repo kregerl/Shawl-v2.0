@@ -1,0 +1,8 @@
+{
+    "workbench.colorCustomizations": {
+        "[Gruvbox Dark Hard]": {
+            "editorInlayHint.background": "#19191a",
+            "editorInlayHint.foreground": "#c4c4c5"
+        }
+    }
+}
