@@ -1,26 +1,17 @@
-use core::time;
 use std::{
-    io::{Read, Write},
-    mem::size_of,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    io::{Write, BufReader, BufRead},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::{Duration, SystemTime},
+    time::Duration, fs::File, collections::HashSet,
 };
 
-use async_minecraft_ping::ConnectionConfig;
 use clap::{value_parser, Arg, ArgAction, Command};
 use futures::{stream, StreamExt};
-use ipnet::{Ipv4AddrRange, Ipv4Net};
+use ipnet::Ipv4Net;
 use pinger::ping_server;
 use rand::{seq::SliceRandom, thread_rng};
-use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::net::TcpStream;
-use tokio_postgres::{tls::NoTlsStream, Client, Connection, NoTls, Socket};
+use tokio_postgres::{Client, NoTls};
 
 mod pinger;
 
@@ -32,6 +23,7 @@ async fn main() {
         .version("0.2.0")
         .about("Port scanner searching specifically for open minecraft servers.")
         .subcommand(Command::new("mcp"))
+        .arg(Arg::new("from-file").long("from-file").required(false))
         .arg(
             Arg::new("include")
                 .short('i')
@@ -65,13 +57,15 @@ async fn main() {
         .get_matches();
 
     if let Some(_) = matches.subcommand_matches("mcp") {
-        // let client = connect_to_db().await;
+        let client = connect_to_db().await;
 
-        // client.execute("CREATE TABLE IF NOT EXISTS public.minecraft_servers (addr VARCHAR (25) PRIMARY KEY, max_players SMALLINT, players SMALLINT, version_str TEXT, description TEXT, query_time TIMESTAMP)", &[]).await.unwrap();
+        client.execute("CREATE TABLE IF NOT EXISTS public.minecraft_servers (addr VARCHAR (25) PRIMARY KEY, max_players INTEGER, players INTEGER, version_str TEXT, protocol_version INTEGER, description TEXT, query_time TIMESTAMP)", &[]).await.unwrap();
 
-        // query_scanned_servers(&client, Duration::from_secs(5), 100).await;
+        client.execute("CREATE TABLE IF NOT EXISTS public.confirmed_not_minecraft_servers (addr VARCHAR (25) PRIMARY KEY, error TEXT)", &[]).await.unwrap();
+
+        query_scanned_servers(&client, Duration::from_secs(8), 1000).await;
     } else {
-        let mut ips = vec![];
+        let mut ips;
         if let Some(n) = matches.get_one::<usize>("randoms") {
             ips = generate_random_ranges()[..*n].to_vec();
         } else {
@@ -83,6 +77,19 @@ async fn main() {
             (ips.len() * 5) / 1000
         );
 
+        if let Some(file_name) = matches.get_one::<String>("from-file") {
+            let file = File::open(file_name).unwrap();
+            let lines = BufReader::new(file).lines();
+            let mut set : HashSet<String> = HashSet::new();
+
+            for line in lines {
+                set.insert(line.unwrap());
+            }
+            println!("Found {} unique ip ranges in file {}", set.len(), file_name);
+            let mut ranges = set.into_iter().map(|entry| Ipv4Net::from_str(&entry).unwrap()).collect::<Vec<Ipv4Net>>();
+            ips.append(&mut ranges);
+        }
+
         if let Some(includes) = matches.get_many::<String>("include") {
             let mut x: Vec<Ipv4Net> = includes
                 .map(|include| Ipv4Net::from_str(include).unwrap())
@@ -90,23 +97,24 @@ async fn main() {
             ips.append(&mut x);
         }
 
-        if let (Some(concurrency), Some(timeout)) = (
-            matches.get_one::<usize>("concurrency"),
-            matches.get_one::<u64>("timeout"),
-        ) {
-            let client = connect_to_db().await;
+        // Unwraps are safe here since the args have a default value.
+        let (concurrency, timeout) = (
+            matches.get_one::<usize>("concurrency").unwrap(),
+            matches.get_one::<u64>("timeout").unwrap(),
+        );
 
-            client.execute("CREATE TABLE IF NOT EXISTS public.open_ports (addr VARCHAR (25) PRIMARY KEY, ip VARCHAR (15), port SMALLINT)", &[]).await.unwrap();
-            client
+        let client = connect_to_db().await;
+
+        client.execute("CREATE TABLE IF NOT EXISTS public.open_ports (addr VARCHAR (25) PRIMARY KEY, ip VARCHAR (15), port SMALLINT)", &[]).await.unwrap();
+        client
             .execute(
                 "CREATE TABLE IF NOT EXISTS public.scanned_ports (addr VARCHAR (25) PRIMARY KEY)",
                 &[],
             )
             .await
             .unwrap();
-            println!("Starting Shawl...");
-            scan_multiple_targets(client, &ips, *concurrency, *timeout, DEFAULT_PORTS).await;
-        }
+        println!("Starting Shawl...");
+        scan_multiple_targets(client, &ips, *concurrency, *timeout, DEFAULT_PORTS).await;
     }
 }
 
@@ -232,39 +240,21 @@ async fn connect_to_db() -> Client {
 }
 
 async fn attempt_ping_server(client: &Client, ip: String, port: u16, timeout: Duration) {
-    let mut config = ConnectionConfig::build(&ip);
-    config = config.with_port(port as u16);
-    config = config.with_timeout(timeout);
-
-    let connection = match config.connect().await {
-        Ok(conn) => conn,
-        Err(_) => {
-            println!("Error connecting to Minecraft server");
-            return;
-        }
-    };
-    match connection.status().await {
-        Ok(ping) => {
-            println!("Here: {:#?}", ping.status);
-            println!(
-                "players: {}/{}",
-                ping.status.players.online, ping.status.players.max
-            );
-            println!("description: {:#?}", ping.status.description);
-            println!(
-                "version: {} -- {}",
-                ping.status.version.name, ping.status.version.protocol
-            );
-            let description_str = match ping.status.description {
-                async_minecraft_ping::ServerDescription::Plain(text) => text,
-                async_minecraft_ping::ServerDescription::Object { text } => text,
+    match ping_server(&ip, port, timeout).await {
+        Ok(status) => {
+            let description_str = match status.description {
+                pinger::Description::Plain(text) => text,
+                pinger::Description::ChatObject { text } => text,
             };
 
-            client.execute("INSERT INTO public.minecraft_servers(addr, max_players, players, version_str, description, query_time) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (addr) DO NOTHING ", 
-            &[&format!("{}:{}", &ip, port), &(ping.status.players.max as i16), &(ping.status.players.online as i16), &ping.status.version.name, &description_str]).await.unwrap();
+            println!("Got minecraft server: {}:{}", ip, port);
+
+            client.execute("INSERT INTO public.minecraft_servers(addr, max_players, players, version_str, protocol_version, description, query_time) VALUES ($1, $2, $3, $4, $5, $6, now()) ON CONFLICT (addr) DO NOTHING ", 
+            &[&format!("{}:{}", &ip, port), &status.players.max, &status.players.online, &status.version.name, &status.version.protocol, &description_str]).await.unwrap();
         }
-        Err(_) => {
-            println!("Error pinging Minecraft server");
+        Err(error) => {
+            println!("Error: {}", error.to_string());
+            client.execute("INSERT INTO public.confirmed_not_minecraft_servers(addr, error) VALUES ($1, $2) ON CONFLICT (addr) DO NOTHING", &[&format!("{}:{}", ip, port), &error.to_string()]).await.unwrap();
             return;
         }
     }
@@ -273,13 +263,20 @@ async fn attempt_ping_server(client: &Client, ip: String, port: u16, timeout: Du
 async fn query_scanned_servers(client: &Client, timeout: Duration, concurrency: usize) {
     let mut futures = Vec::new();
     let rows = client.query("SELECT op.ip, op.port FROM open_ports op WHERE NOT EXISTS(SELECT FROM minecraft_servers ms WHERE op.addr = ms.addr)", &[]).await.unwrap();
+    println!("Got {} rows", rows.len());
     for row in rows {
         let ip_str: &str = row.get("ip");
         let ip: String = ip_str.into();
         let port: i16 = row.get("port");
-        futures.push(attempt_ping_server(&client, ip.clone(), port as u16, timeout));
+        futures.push(attempt_ping_server(
+            &client,
+            ip.clone(),
+            port as u16,
+            timeout,
+        ));
     }
 
+    println!("Streaming...");
     stream::iter(futures)
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()

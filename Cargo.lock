@@ -48,6 +48,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
+name = "bit_utils"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8114dca45a04a4bdaf03de9976a3131cf954827757f971d84cd431a9f2cc26d"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,9 +812,12 @@ dependencies = [
  "ipnet",
  "rand",
  "rpassword",
+ "serde",
+ "serde_json",
  "signal-hook",
  "tokio",
  "tokio-postgres",
+ "varint",
 ]
 
 [[package]]
@@ -1070,6 +1079,15 @@ name = "unicode-width"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0edd1e5b14653f783770bce4a4dabb4a5108a5370a5f5d8cfe8710c361f6c8b"
+
+[[package]]
+name = "varint"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c37be5674e0be9c72790681999b0e6f09f03d3fc5d8904cfe2db615aad65887b"
+dependencies = [
+ "bit_utils",
+]
 
 [[package]]
 name = "version_check"
